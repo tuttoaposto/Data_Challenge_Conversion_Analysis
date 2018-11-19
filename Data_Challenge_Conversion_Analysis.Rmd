@@ -1,0 +1,349 @@
+---
+title: "Data Challenge - Price Elasticity"
+subtitle: |
+    | Conversion Analysis
+    | Objective:   Build quote-to-purchase conversion curve as a function of price
+date: "`r format(Sys.Date(), '%Y.%m.%d')`"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r Library}
+library(lubridate)
+library(stringr)
+library(ggplot2)
+library(dplyr)
+library(sqldf)
+library(aod)
+```
+
+###Read in data
+```{r Read data}
+#gsub('\\\\','/',readClipboard())
+setwd(readClipboard())
+df <-read.csv(gzfile('data_challenge_price.csv.gz','rt')
+              , header=T
+              , stringsAsFactors = F)
+str(df)
+```
+
+###Quick glance
+```{r Glance}
+sapply(df[c(2:5)], function(x) table(x))
+nrow(unique(df[1]))
+summary(df$yearly_premium)
+```
+Buz ID: 30650
+Cob_ID: 5
+State: 46
+Bundle: 6
+
+### Not sure why orig_premium is double-quoted, change type
+```{r}
+df$orig_premium1 <- as.numeric(str_sub(df$orig_premium, 2, -2))
+
+##Checking
+y <- df[is.na(df$orig_premium1)==F, c("yearly_premium", "orig_premium", "orig_premium1")]
+
+y <- unique(y[order(y$orig_premium1),])
+head(y); tail(y)
+```
+If orig_premium represents the premium before rounding up to the minimum, some prices seem to be ridiculously too low for a sound policy. We wouldn't use it to construct price elasticity curves.
+
+
+###Highly skewed yearly premium
+```{r}
+ggplot(data = df[df$yearly_premium > 10000, ], aes(x = yearly_premium)) + 
+  geom_histogram(bins= 500, color = 'black') +
+  ggtitle("Yearly Premium > $10000")
+```
+
+###Premium range by state, cob
+```{r}
+premium_range <-
+  df %>% group_by(state, cob_id) %>%
+         summarise(minPrem = min(yearly_premium)
+                   ,maxPrem = max(yearly_premium))
+
+##Fluctuation of state-cob specific premium range
+premium_range %>% group_by(cob_id) %>%
+                  summarise(min_minPrem = min(minPrem)
+                            ,max_minPrem = max(minPrem)
+                            ,min_maxPrem = min(maxPrem)
+                            ,max_maxPrem = max(maxPrem))
+
+```
+Minimum premium set to $350, fluctuates ~$100 - $200 across states, depending on cob.
+
+### Select premium
+```{r}
+#g <- function(x) c(n = length(x), quantile(x, c(0, 0.25, 0.5, 0.75, 0.9, 0.99, 1)))
+#tapply(df$yearly_premium, df$status_name, g)
+df %>% group_by(status_name) %>%
+       summarise(n = n()
+                  ,min = min(yearly_premium)
+                  ,q25 = quantile(yearly_premium, 0.25)
+                 ,q50 = quantile(yearly_premium, 0.5)
+                 ,q75 = quantile(yearly_premium, 0.75)
+                 ,q90 = quantile(yearly_premium, 0.9)
+                 ,q99 = quantile(yearly_premium, 0.99)
+                 ,max = max(yearly_premium)
+    )
+
+
+### Pick latest quote per status
+
+#   If any quote is purchased (status of Active or Canceled), use the associated premium
+# Else, if any quote is selected (meaning the user has selected that package and clicked through to the payment screen), use the associated premium from the latest quote
+# Else, use the associated premium from the latest quote for the Pro bundle
+
+### Assume one staus per business id regardless of state
+last_quote <- sqldf("select *, case when status_name in ('Active', 'Canceled') then 1
+                                   when status_name = 'Selected' then 2
+                                   when status_name = 'Quote' and bundle_name = 'pro' then 3
+                                   else 4    
+                                   end as s
+                         From df
+                         group by business_id, s
+                         having creation_time = max(creation_time)
+                         order by business_id, s")
+
+### Check if business with only Quote status always have pro bundle
+Quote <- sqldf("select * From last_quote where business_id not in
+                (select business_id from last_quote where s in (1,2))")
+DFO <- sqldf("select business_id from Quote where status_name = 'Quote' and bundle_name != 'pro'
+              except
+              select business_id from Quote where status_name = 'Quote' and bundle_name = 'pro'")
+### -> 0 count, Yes!
+
+
+status <- sqldf("select *
+                ,case when s =1 then 1 else 0 end as Converted
+                From last_quote
+                  group by business_id
+                  having s = min(s)") # --> get back 30650 unique business id!
+table(status[status$s==3, ]$bundle_name) #--> if status = Quote, bundle = pro!
+
+table(status$status_name)
+```
+
+
+###Coversion rate
+```{r}
+### Overall
+round(prop.table(table(status$Converted))*100, 2)
+#tapply(status$Converted, status$cob_id, function(x) prop.table(table(x)))
+```
+28% converted overall
+
+### By business class
+```{r}
+
+### Tabulate
+status %>% group_by(cob_id) %>% summarise('Conversion%' = round(mean(Converted)*100, 2)) %>%
+                                arrange(desc(.$'Conversion%'))
+
+### Statistical test
+status$cob_id <- factor(status$cob_id)
+logit_cob <- glm(Converted ~ cob_id, data = status, family = "binomial")
+#summary(logit_cob)
+
+wald.test(b = coef(logit_cob), Sigma = vcov(logit_cob), Terms = 2:5)
+```
+Conversion% significantly different between business classes
+
+### By State
+```{r}
+### Tabulate
+Conv_State <- status %>% 
+              group_by(state) %>% 
+              summarise(conversion_rate = round(mean(Converted)*100, 2)) %>%
+              arrange(desc(.$conversion_rate))
+
+Conv_State 
+
+### Visualize
+ggplot(data = Conv_State, aes(x = reorder(state, -conversion_rate), y = conversion_rate))+
+  geom_point() +
+  geom_line(group=1) + 
+  labs(x = 'State') + 
+  ggtitle("Conversion Rate per State")
+
+### Statistical test
+logit_state <- glm(Converted ~ state, data = status, family = "binomial")
+#summary(logit_state)
+
+wald.test(b = coef(logit_state), Sigma = vcov(logit_state), Terms = 2:46)
+
+``` 
+Conversion% significantly different between states, ranging from 13% to 48%
+  
+
+
+
+### By pricing bin
+```{r}
+### Distribution of premium per converted status
+g <- function(x) c(n = length(x), quantile(x, c(0, 0.25, 0.5, 0.75, 0.9, 0.99, 1)))
+tapply(status$yearly_premium, status$Converted, g)
+
+### Highly skewed distribution, zoom in to just premium < $1500 and see how conversion varies
+
+# ggplot(status[status$yearly_premium <=1500, ],
+#        aes(x=bin10, color =as.factor(Converted))) +
+#   geom_histogram(fill="white", binwidth = 10, stat = 'count') +
+#   ggtitle('Conversion vs Premium')
+
+### Cut into $10 increments, 116 buckets
+cutoff <- seq(350, 1500, 10)
+status$bin10 <- cut(status$yearly_premium, breaks = cutoff, right = F, labels = F)
+status[is.na(status$bin10), ]$bin10 <- 116
+
+x <- status %>% group_by(bin10) %>%
+                summarise(min = min(yearly_premium)
+                          ,max = max(yearly_premium))
+
+#tail(x)
+
+Conv_bin10 <- status %>%
+              group_by(bin10) %>% 
+              summarise(conversion_rate = round(mean(Converted)*100, 2))
+
+Conv_bin10 <- sqldf("select x.*, b.conversion_rate 
+                    from x left join Conv_bin10 b
+                    on x.bin10 = b.bin10")
+Conv_bin10
+
+ggplot(data=Conv_bin10,aes(x=min, y=conversion_rate)) +
+  geom_point() +
+  geom_line(group=1) +
+  scale_x_continuous(breaks=seq(350,1500,50)) +
+  labs(x = 'Premium in $10 increment, lower bound'
+       ,y = 'Conversion Rate %') +
+  ggtitle('Conversion vs Premium')
+```
+This price elasticity curve makes sense as we would expect more people to buy an insurance policy at a lower price.
+
+### Based on the line graph, re-bin premium into smaller number of buckets  
+```{r}
+mean(status[status$yearly_premium >=350 & status$yearly_premium <360, ]$Converted) #34.0%
+mean(status[status$yearly_premium >=360 & status$yearly_premium <440, ]$Converted) #40.7%
+mean(status[status$yearly_premium >=440 & status$yearly_premium <600, ]$Converted) #35.4%
+mean(status[status$yearly_premium >=600 & status$yearly_premium <720, ]$Converted) #32.7%
+mean(status[status$yearly_premium >=720 & status$yearly_premium <1000, ]$Converted) #28.4
+mean(status[status$yearly_premium >=1000 & status$yearly_premium <1360, ]$Converted) #20.4%
+mean(status[status$yearly_premium >=1360, ]$Converted) #11.9%
+
+# ggplot(status[status$yearly_premium <=1500, ],
+#        aes(x=yearly_premium, color =as.factor(Converted))) +
+#   geom_histogram(fill="white", binwidth = 10) +
+#   ggtitle('Conversion vs Premium')
+  
+status$bin <- ifelse(status$yearly_premium >=350 & status$yearly_premium <360, '1-350-359',
+                     ifelse(status$yearly_premium >=360 & status$yearly_premium <440, '2-360-439',
+                      ifelse(status$yearly_premium >=440 & status$yearly_premium <600, '3-440-599',
+                        ifelse(status$yearly_premium >=600 & status$yearly_premium <720, '4-600-719',
+                          ifelse(status$yearly_premium >=720 & status$yearly_premium <1000, '5-720-999',
+                          ifelse(status$yearly_premium >=1000 & status$yearly_premium <1360, '6-1000-1359',
+                            ifelse(status$yearly_premium >=1360, '7-1360+', 'NA')))))))
+status$bin <-factor(status$bin)
+
+###Check binning
+tapply(status$yearly_premium, status$bin, range)
+
+### Tabulate
+Conv_bin <- status %>% 
+              group_by(bin) %>% 
+              summarise(conversion_rate= round(mean(Converted)*100, 2)
+                        ,n = n()) %>%
+              arrange(desc(.$conversion_rate))
+
+Conv_bin 
+
+### Visualize
+ggplot(data = Conv_bin, aes(x = bin,
+            #x = reorder(bin2, conversion_rate),
+           y = conversion_rate))+
+  geom_point() +
+  geom_line(group=1) + 
+  labs(x = 'Pricing Bin $'
+       ,y = 'Conversion Rate %') + 
+  ggtitle("Conversion Rate per Pricing")
+
+### Statistical test
+logit_bin <- glm(Converted ~ bin, data = status, family = "binomial")
+#summary(logit_bin)
+wald.test(b = coef(logit_bin), Sigma = vcov(logit_bin), Terms = 2:7)
+```
+Conversion% generally drops with increasing premium, and is significantly different between price buckets.
+
+Also, highest conversion rate happens at $360-439. Does it suggset raising the minimum premium from $350 or is it just a minimum price per state requirement for certain business classes?
+
+### Does binning effect change with business class?
+```{r}
+Conv_bin_cob <- status %>% 
+              group_by(cob_id, bin) %>% 
+              summarise(conversion_rate= round(mean(Converted)*100, 2)
+                        ,n = n()) #%>%
+              #arrange(desc(.$conversion_rate))
+
+Conv_bin_cob
+
+### Visualize
+ggplot(data = Conv_bin_cob, aes(x = bin,
+                                #x = reorder(bin2, conversion_rate),
+                                y = conversion_rate)) +
+  geom_point() +
+  geom_line(aes(group=cob_id, color=cob_id)) + 
+  labs(x = 'Pricing Bin $') + 
+  ggtitle("Conversion Rate per Pricing per COB")
+
+```
+Conversion trending generally looks similar across all business classes except for 5003 that shows the highest conversion rate of 26.3% at $350-$359 range. For class 100001, premium starts at $720-$999 range. It's also the same range where the highest conversion hits.
+
+
+### Does binning effect change with state?
+```{r}
+Conv_bin_state <- status %>% 
+              group_by(state, bin) %>% 
+              summarise(conversion_rate= round(mean(Converted)*100, 2)
+                        ,n = n()) #%>%
+              #arrange(desc(.$conversion_rate))
+
+Conv_bin_state 
+
+### Visualize
+### 7 states at a time
+st <- sort(unique(Conv_bin_state$state))
+for (k in 0:6){
+  i=1+k*7
+  if (k==6){
+    j=46
+  }
+  else{
+      j=7+k*7
+  }
+p <- ggplot(data = Conv_bin_state[Conv_bin_state$state %in% st[i:j], ]
+            , aes(x = bin,
+                  #x = reorder(bin, conversion_rate),
+                  y = conversion_rate)) +
+    geom_point() +
+    geom_line(aes(group=state, color=state)) + 
+    labs(x = 'Pricing Bin $'
+         ,y = 'Conversion Rate %') + 
+    ggtitle(paste("Conversion Rate per Pricing per States ", st[i], " - ", st[j]))
+
+print(p)
+}
+```
+
+Conversion trending does vary by state. Not all the states start and peak at the same price range. For example, CA, ME, ND, OK, VT, WY start from $440 - $599 range. OK peaks at $600 - 719 range.
+Some states have very small sample size (e.g. only 15 customers in DC) and absolute conversion of 100% is based on only 1 case.
+
+Setting minimum premium should take factors like business class and state into consideration, because different business classes may have different risk levels to protect and different states may have different concentrations of business and regulations. Also, when looking at favorable pricing in terms of conversion, one needs to also look at the size of converted pool -- are we talking about 9 cases out of 10 or 900 cases out of 1000 being converted? Basing minimum premium on sparse data can lead to unreliable results.
+
+
+
